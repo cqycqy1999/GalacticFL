@@ -4,7 +4,7 @@ from typing import List
 from tqdm import tqdm
 import fire
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaTokenizer, LlamaForCausalLM, GPT2Tokenizer, GPT2Model, GPT2LMHeadModel, AutoConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from peft import (
     LoraConfig,
     get_peft_model,
@@ -22,27 +22,27 @@ import copy
 
 def fl_finetune(
         # model/data params
-        global_model: str = 'huggyllama/llama-7b',
-        data_path: str = './data',
-        output_dir: str = './fedgpt-llama7b-5-2/',
+        global_model: str = 'bigscience/bloom-560m', # 模型名字
+        data_path: str = './data', # 数据路径
+        output_dir: str = './moti0', # 输出路径
         # FL hyperparamas
-        client_selection_strategy: str = 'random',
-        client_selection_frac: float = 1,
-        num_communication_rounds: int = 5,
-        num_clients: int = 10,
+        client_selection_strategy: str = 'random', # 不动
+        client_selection_frac: float = 1, # 每一轮参与训练的比例
+        num_communication_rounds: int = 5, # 通信轮数
+        num_clients: int = 10, # 客户端数量
         # Local training hyperparams
         local_batch_size: int = 128,  # 64,
-        local_micro_batch_size: int = 16,
+        local_micro_batch_size: int = 16, # 梯度累积的batch size
         local_num_epochs: int = 3,
         local_learning_rate: float = 3e-4,
         local_val_set_size: int = 0,
         local_save_steps: int = 3,
-        cutoff_len: int = 512,
+        cutoff_len: int = 512, # 超过这个就截断
         # LoRA hyperparams
-        lora_r: int = 16,
-        lora_alpha: int = 32,
+        lora_r: int = 16, # rank level
+        lora_alpha: int = 32, # 缩放因子
         lora_dropout: float = 0.05,
-        lora_target_modules: List[str] = [
+        lora_target_modules: List[str] = [ # 低秩适配器作用的模块
             "q_proj",
             "v_proj",
         ],
@@ -50,17 +50,17 @@ def fl_finetune(
         train_on_inputs: bool = True,
         group_by_length: bool = False,
         resume_from_checkpoint: str = None,  # either training checkpoint or final adapter
-        prompt_template_name: str = "alpaca",  # The prompt template to use, will default to alpaca.
-        # aggregation mode
-        stacking: bool = False,
+        prompt_template_name: str = "alpaca",  # TODO The prompt template to use, will default to alpaca.
+        # TODO aggregation mode
+        stacking: bool = False, 
         # evaluation
-        dev_data_path: str = './mmlu_test_1444.jsonl',
+        dev_data_path: str = './mmlu_test_1444.jsonl', # TODO ？这个数据集是干嘛的
         # heterogeneous
-        heter: bool = False,
+        heter: bool = False, # 适配器是否异构
         local_ranks: List[int] = [64, 32, 16, 16, 8, 8, 4, 4, 4, 4],
         zero_padding: bool = False,
         Adalora: bool = False,
-        full: bool = False
+        full: bool = False # 适配器是否全一致？
 ):
     if int(os.environ.get("LOCAL_RANK", 0)) == 0:
         print(
@@ -105,36 +105,16 @@ def fl_finetune(
         device_map = {"": int(os.environ.get("LOCAL_RANK") or 0)}
         gradient_accumulation_steps = gradient_accumulation_steps // world_size
 
-    if global_model == 'gpt2':
-        model = GPT2LMHeadModel.from_pretrained(
-            global_model,
-            load_in_8bit=False,
-            torch_dtype=torch.float32,
-            device_map=device_map,
-        )
-    elif global_model == 'google/gemma-2b' or global_model == 'google/gemma-7b':
-        model = AutoModelForCausalLM.from_pretrained(
-            global_model,
-            load_in_8bit=False,
-            torch_dtype=torch.float32,
-            device_map=device_map,
-            token='your token',
-        )
-    else:
-        model = LlamaForCausalLM.from_pretrained(
-            global_model,
-            load_in_8bit=False,
-            torch_dtype=torch.float32,
-            device_map=device_map,
-            token="your token",
-        )
+    model = AutoModelForCausalLM.from_pretrained(
+        global_model,
+        load_in_8bit=False,
+        torch_dtype=torch.float32,
+        device_map=device_map,
+    )
 
-    if global_model == 'gpt2':
-        tokenizer = GPT2Tokenizer.from_pretrained(global_model)
-    elif global_model == 'google/gemma-2b' or global_model == 'google/gemma-7b':
-        tokenizer = AutoTokenizer.from_pretrained(global_model, token='your_token',)
-    else:
-        tokenizer = LlamaTokenizer.from_pretrained(global_model, token="your_token",)
+
+    tokenizer = AutoTokenizer.from_pretrained(global_model, token='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',)
+
 
     tokenizer.pad_token_id = (
         0
@@ -162,23 +142,24 @@ def fl_finetune(
         return result
 
     def generate_and_tokenize_prompt(data_point):
-        if data_path == './data/10':
+        if './data_Dolly' in data_path:
             full_prompt = prompter.generate_prompt(
                 data_point["instruction"],
                 data_point["context"],
                 data_point["response"],
+                data_point["category"],
             )
-        elif data_path == './data_wiz/10' or data_path == './data_mix/20':
+        elif './data_CodeAlpaca' in data_path:
             full_prompt = prompter.generate_prompt(
                 data_point["instruction"],
-                None,
+                data_path["input"],
                 data_point["output"],
             )
-        else:
+        elif './data_GSM8K' in data_path:
             full_prompt = prompter.generate_prompt(
-                data_point["instruction"],
-                data_point["input"],
-                data_point["output"],
+                data_point["question"],
+                data_point["answer"],
+                # data_point["output"],
             )
 
         tokenized_full_prompt = tokenize(full_prompt)

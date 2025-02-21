@@ -8,13 +8,13 @@ from typing import Union
 
 
 class Prompter(object):
-    __slots__ = ("template", "_verbose")
+    __slots__ = ("template", "_verbose") # 类级变量，限制实例只能拥有template和_verbose两个属性，禁止动态添加其他属性；用于优化内存占用和属性访问速度
 
     def __init__(self, template_name: str = "", verbose: bool = False):
         self._verbose = verbose
         if not template_name:
             # Enforce the default here, so the constructor can be called with '' and will not break.
-            template_name = "alpaca"
+            template_name = "alpaca" # 默认template
         file_name = osp.join("templates", f"{template_name}.json")
         if not osp.exists(file_name):
             raise ValueError(f"Can't read {file_name}")
@@ -43,7 +43,7 @@ class Prompter(object):
             )
         if label:
             res = f"{res}{label}"
-        if self._verbose:
+        if self._verbose: 
             print(res)
         return res
 

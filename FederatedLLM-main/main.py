@@ -92,7 +92,7 @@ def fl_finetune(
         global_model
     ), "Please specify a --global_model, e.g. --global_modell='decapoda-research/llama-7b-hf'"
 
-    data_path = os.path.join(data_path, str(num_clients))
+    # data_path = os.path.join(data_path, str(num_clients)) # TODO 需要改
     assert (os.path.exists(data_path), "Please generate the data files for each client")
 
     # set up the global model & toknizer
@@ -155,7 +155,8 @@ def fl_finetune(
                 data_path["input"],
                 data_point["output"],
             )
-        elif './data_GSM8K' in data_path:
+        else: 
+            # './data_GSM8K' in data_path:
             full_prompt = prompter.generate_prompt(
                 data_point["question"],
                 data_point["answer"],

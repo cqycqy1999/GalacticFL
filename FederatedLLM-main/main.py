@@ -22,7 +22,7 @@ import copy
 
 def fl_finetune(
         # model/data params
-        global_model: str = 'bigscience/bloom-560m', # 模型名字
+        global_model: str = 'decapoda-research/llama-7b-hf', # 模型名字
         data_path: str = './data', # 数据路径
         output_dir: str = './moti0', # 输出路径
         # FL hyperparamas

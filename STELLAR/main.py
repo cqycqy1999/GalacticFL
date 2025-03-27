@@ -23,7 +23,7 @@ def STELLAR(
         client_selection_ratio: float = 1,
         num_rounds: int = 5,
         num_clients: int = 10,
-        niid: float = 0.3,
+        niid: float = 0.1,
         # FL client argparse
         local_batch_size: int = 128,
         local_micro_batch_size: int = 16, # TODO
@@ -92,7 +92,7 @@ def STELLAR(
             f"is_FFT: {full_finetuning}\n"
         )
 
-    data_path = os.path.join(data_path, "Dolly", str(num_clients), str(niid).replace(".","")) # TODO
+    # data_path = os.path.join(data_path, "Dolly", str(num_clients), str(niid).replace(".","")) # TODO
     assert (os.path.exists(data_path)), f"Please generate the data files for each client."
 
     gradient_accumulation_steps = local_batch_size // local_micro_batch_size

@@ -7,15 +7,17 @@ from tqdm import tqdm
 
 import torch
 from utils.prompter import Prompter
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from peft import LoraConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+from peft import LoraConfig, AdaLoraConfig, PeftModel ,get_peft_model
+from FL_utils import (GeneralClient, FedAvg, client_selection,
+                      global_evaluation)
 
 
 def STELLAR(
         # model/data argparse
         global_model: str = "decapoda-research/llama-7b-hf",
         data_path: str = "./data", #TODO
-        output_dir_path: str = "./", #TODO
+        output_dir_path: str = "./output", #TODO
         # FL server argparse
         client_selection_strategy: str = "random",
         client_selection_ratio: float = 1,
@@ -27,7 +29,7 @@ def STELLAR(
         local_micro_batch_size: int = 16, # TODO
         local_epochs: int = 3,
         local_learning_rate: float = 3e-4,
-        local_val_setsize: int = 9,
+        local_val_setsize: int = 0,
         local_save_steps: int = 3, # TODO
         cutoff_len: int = 512, # TODO 这个值可能也是一个因素
         # LoRA argparse
@@ -81,13 +83,13 @@ def STELLAR(
             f"group_by_length: {group_by_length}\n"
             f"resume_from_checkpoint: {resume_from_checkpoint}\n"
             f"prompt_template_name: {prompt_template_name}\n"
-            f"stacking: {stacking}\n"
+            f"is_stacking: {stacking}\n"
             f"dev_data_path: {dev_data_path}\n"
             f"heter_adapter: {heter_adapter}\n"
             f"local_ranks: {local_ranks}\n"
-            f"zero_padding: {zero_padding}\n"
-            f"Adalora: {Adalora}\n"
-            f"full: {full_finetuning}\n"
+            f"is_zero_padding: {zero_padding}\n"
+            f"is_Adalora: {Adalora}\n"
+            f"is_FFT: {full_finetuning}\n"
         )
 
     data_path = os.path.join(data_path, "Dolly", str(num_clients), str(niid).replace(".","")) # TODO
@@ -196,14 +198,179 @@ def STELLAR(
         else:
             config = LoraConfig(
                 base_model_name_or_path = global_model,
-                r = lora_r,
-                lora_alpha = lora_alpha,
+                r = lora_r * num_clients,
+                lora_alpha = lora_alpha * num_clients,
                 target_modules = lora_target_modules,
                 lora_dropout = lora_dropout,
                 bias = "none",
                 task_type = "CAUSAL_LM",
             )
 
+    # TODO 这个地方可能会导致模型被拆分 会和分裂联邦相关
+    if not ddp and torch.cuda.device_count() > 1:
+        model.is_parallelizable = True
+        model.model_parallel = True
+
+    print("The process of federated instruction-tuning has started..")
+    previously_selected_clients_set = set()
+    last_client_id = None
+    local_dataset_len_dict = dict()
+    if "Dolly" in data_path:
+        dataset_name = "Dolly"
+    elif "CodeAlpaca" in data_path:
+        dataset_name = "CodeAlpaca"
+    else:
+        dataset_name = "GSM8K"
+    output_dir_path = os.path.join(output_dir_path, dataset_name, str(num_clients), str(niid).replace(".",""))
     
+    acc_list = []
+
+    for epoch in tqdm(range(num_rounds)):
+        print("Conducting the client selection...")
+        selected_clients_set = client_selection(num_clients, client_selection_ratio, client_selection_strategy, epoch)
+
+        for client_id in selected_clients_set:
+            if not full_finetuning:
+                if Adalora:
+                    config = AdaLoraConfig(
+                        r = local_ranks[client_id],
+                        lora_alpha = 2 * local_ranks[client_id],
+                        target_modules = lora_target_modules,
+                        lora_dropout = lora_dropout,
+                        bias = "none",
+                        task_type = "CAUSAL_LM",
+                        base_model_name_or_path = global_model 
+                    )
+                    model_client = copy.deepcopy(model)
+                    model_client = get_peft_model(model_client, config)
+                else:
+                    if stacking:
+                        if heter_adapter:
+                            config = LoraConfig(
+                                r = local_ranks[client_id],
+                                lora_alpha = 2 * local_ranks[client_id],
+                                target_modules = lora_target_modules,
+                                lora_dropout = lora_dropout,
+                                bias = "none",
+                                task_type = "CAUSAL_LM",
+                                base_model_name_or_path = global_model
+                            )
+                            model_client = copy.deepcopy(model)
+                            model_client = get_peft_model(model_client, config)
+                        else:
+                            config = LoraConfig(
+                                r = lora_r,
+                                lora_alpha = lora_alpha,
+                                target_modules = lora_target_modules,
+                                lora_dropout = lora_dropout,
+                                bias = "none",
+                                task_type = "CAUSAL_LM",
+                                base_model_name_or_path = global_model
+                            )
+                            model_client = copy.deepcopy(model)
+                            model_client = get_peft_model(model_client, config)
+                    else:
+                        if heter_adapter:
+                            config = LoraConfig(
+                                r = local_ranks[client_id],
+                                lora_alpha = 2 * local_ranks[client_id],
+                                target_modules = lora_target_modules,
+                                lora_dropout = lora_dropout,
+                                bias = "none",
+                                task_type = "CAUSAL_LM",
+                                base_model_name_or_path = global_model
+                            )
+                            model_client = copy.deepcopy(model)
+                            model_client = get_peft_model(model_client, config)
+            else:   
+                model_client = model
+
+            client = GeneralClient(client_id, model_client, data_path, output_dir_path)
+
+            print("\nPreparing the local dataset and trainer for Client_{}".format(client_id))
+            client.prepare_local_dataset(generate_and_tokenize_prompt, local_val_setsize)
+            client.build_local_trainer(
+                tokenizer,
+                local_micro_batch_size,
+                gradient_accumulation_steps,
+                local_epochs,
+                local_learning_rate,
+                group_by_length,
+                ddp,
+            )
+
+            print("Initiating the local training of Client_{}".format(client_id))
+            client.initiate_local_training()
+
+            print("Local training starts ... ")
+            client.train()
+
+            print("\nTerminating the local training of Client_{}".format(client_id))
+            model_client, local_dataset_len_dict, previously_selected_clients_set, last_client_id = client.terminate_local_training(
+                epoch, local_dataset_len_dict, previously_selected_clients_set, last_client_id
+            )
+            del client
+
+        print("\nCollecting the weights of clients and Conducting the global model aggregation...")
+
+        model = FedAvg(model, selected_clients_set, 
+                       output_dir_path, local_dataset_len_dict,
+                       epoch, stacking, lora_r, heter_adapter, local_ranks,
+                       zero_padding, full_finetuning)
+        
+        if not full_finetuning:
+            if stacking:
+                config.save_pretrained(
+                    os.path.join(output_dir_path, str(epoch)), load_in_8bit = False, 
+                    torch_dtype = torch.float32, device_map = device_map
+                )
+                model = PeftModel.from_pretrained(
+                    model, os.path.join(output_dir_path, str(epoch))
+                )
+            else:
+                torch.save(model.state_dict(), os.path.join(output_dir_path, str(epoch), "adapter_model.bin"))
+                config.save_pretrained(
+                    os.path.join(output_dir_path, str(epoch)), load_in_8bit = False, 
+                    torch_dtype = torch.float16, device_map = device_map
+                )
+        else:
+            config = AutoConfig.from_pretrained(global_model)
+            tokenizer.save_pretrained(
+                os.path.join(output_dir_path, str(epoch)), 
+                load_in_8bit = False, torch_dtype = torch.float32, device_map = device_map
+            )
+            config.save_pretrained(
+                os.path.join(output_dir_path, str(epoch)), 
+                load_in_8bit = False, torch_dtype = torch.float32, device_map = device_map
+            )
+
+            print("save model...")
+
+            acc = global_evaluation(model, tokenizer, prompter, dev_data_path, output_dir_path)
+            print('Acc of Epoch', str(epoch), "is:", acc)
+            acc_list.append(acc)
+
+            if stacking:
+                model = model.merge_and_unload()
+                model.save_pretrained(os.path.join(output_dir_path, str(epoch)+'/final'),
+                                      load_in_8bit = False,
+                                      torch_dtype = torch.float32,
+                                      device_map = device_map)
+                
+            if epoch < (num_rounds-1):
+                rm_dir = os.path.join(output_dir_path, str(epoch))
+                os.system("rm -rf {xxxxx}".format(xxxxx = rm_dir))
+
+            print(acc_list)
+            filename = output_dir_path + "log.txt"
+            file = open(filename, 'a')
+            for i in range(len(acc_list)):
+                s = str(acc_list[i].replace('[','').replace(']',''))
+                s = s.replace("'",'').replace(',','') +'\n'
+                file.write(s)
+            file.close()
+            print("Log Saved")
+                
+
 if __name__ == "__main__":
     fire.Fire(STELLAR)

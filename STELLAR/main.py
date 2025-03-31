@@ -369,7 +369,7 @@ def STELLAR(
     filename = output_dir_path + "log.txt"
     file = open(filename, 'a')
     for i in range(len(acc_list)):
-        s = str(acc_list[i].replace('[','').replace(']',''))
+        s = str(acc_list[i]).replace('[','').replace(']','')
         s = s.replace("'",'').replace(',','') +'\n'
         file.write(s)
     file.close()

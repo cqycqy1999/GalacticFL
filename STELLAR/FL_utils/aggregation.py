@@ -123,7 +123,7 @@ def FedAvg(model,
         torch.save(weighted_single_weights, os.path.join(output_dir_path, str(epoch), "adapter_model.bin"))
         return model
     elif full_finetuning:
-        torch.save(weighted_single_weights, os.path.join(output_dir_path, str(epoch), "entire_model.bin"))
+        torch.save(weighted_single_weights, os.path.join(output_dir_path, str(epoch), "pytorch_model.bin"))
         model.load_state_dict(weighted_single_weights)
         return model
     else:

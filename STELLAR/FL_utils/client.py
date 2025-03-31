@@ -100,9 +100,9 @@ class GeneralClient:
         #     dataset_name = "CodeAlpaca"
         # else: # GSM8K
         #     dataset_name = "GSM8K"
-        single_output_dir = os.path.join(self.output_dir_path, "adapter_weights", str(epoch), f"adapter_weight_{self.client_id}")
+        single_output_dir = os.path.join(self.output_dir_path, str(epoch), "local_output_{}".format(self.client_id))
         os.makedirs(single_output_dir, exist_ok=True)
-        torch.save(new_adapter_weight, os.path.join(single_output_dir, "adapter_weight.pt"))
+        torch.save(new_adapter_weight, single_output_dir + "/pytorch_model.bin")
 
         older_adapter_weight = get_peft_model_state_dict(self.model, self.params_dict_old, "default")
         set_peft_model_state_dict(self.model, older_adapter_weight, "default")

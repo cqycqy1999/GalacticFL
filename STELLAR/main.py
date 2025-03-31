@@ -21,13 +21,13 @@ def STELLAR(
         # FL server argparse
         client_selection_strategy: str = "random",
         client_selection_ratio: float = 1,
-        num_rounds: int = 5,
+        num_communication_rounds: int = 3, 
         num_clients: int = 10,
         niid: float = 0.1,
         # FL client argparse
         local_batch_size: int = 128,
         local_micro_batch_size: int = 16, # TODO
-        local_epochs: int = 3,
+        local_epochs: int = 1,
         local_learning_rate: float = 3e-4,
         local_val_setsize: int = 0,
         local_save_steps: int = 3, # TODO
@@ -65,7 +65,7 @@ def STELLAR(
             f"output_dir_path: {output_dir_path}\n"
             f"client_selection_strategy: {client_selection_strategy}\n"
             f"client_selection_ratio: {client_selection_ratio}\n"
-            f"num_rounds: {num_rounds}\n"
+            f"num_communication_rounds: {num_communication_rounds}\n"
             f"num_clients: {num_clients}\n"
             f"niid: {niid}\n"
             f"local_batch_size: {local_batch_size}\n"
@@ -96,7 +96,7 @@ def STELLAR(
     assert (os.path.exists(data_path)), f"Please generate the data files for each client."
 
     gradient_accumulation_steps = local_batch_size // local_micro_batch_size
-    prompter = Prompter
+    prompter = Prompter(prompt_template_name)
 
     # TODO 分布式进程下的处理，fl？
     device_map = "auto"
@@ -137,13 +137,13 @@ def STELLAR(
 
         return result
     
-    def generate_and_tokenize_prompt(data_point): # TODO 先这样
+    def generate_and_tokenize_prompt(data_point): # TODO 先这样;在prompter.py的generate_prompt函数中，有三个参数，分别是instruction，input和label（其实就是输出啦）
         if "Dolly" in data_path:
+            instruction = f"{data_point['instruction']} {data_point['category']}"
             full_prompt = prompter.generate_prompt(
-                data_point["instruction"],
+                instruction,
                 data_point["context"],
                 data_point["response"],
-                data_point["category"],
             )
         elif "CodeAlpaca" in data_path:
             full_prompt = prompter.generate_prompt(
@@ -155,6 +155,7 @@ def STELLAR(
             # if GSM8K in data_path
             full_prompt = prompter.generate_prompt(
                 data_point["question"],
+                None,
                 data_point["answer"],
             )
         
@@ -172,11 +173,11 @@ def STELLAR(
 
         return tokenized_full_prompt
 
-    # lora adapterrs aggregation
-    if full_finetuning == False:
-        if stacking == False:
+    # lora adapterrs aggregation Server
+    if not full_finetuning:
+        if not stacking:
             if zero_padding:
-                config = LoraConfig(
+                config_ori = LoraConfig(
                     base_model_name_or_path = global_model,
                     r = max(local_ranks),
                     lora_alpha = lora_alpha * max(local_ranks),
@@ -196,9 +197,10 @@ def STELLAR(
                     task_type = "CAUSAL_LM",
                 )
         else:
-            config = LoraConfig(
+            config_ori = LoraConfig(
                 base_model_name_or_path = global_model,
-                r = lora_r * num_clients,
+                # r = lora_r * num_clients,
+                r = sum(local_ranks) if heter_adapter else lora_r * num_clients, # TODO
                 lora_alpha = lora_alpha * num_clients,
                 target_modules = lora_target_modules,
                 lora_dropout = lora_dropout,
@@ -225,7 +227,7 @@ def STELLAR(
     
     acc_list = []
 
-    for epoch in tqdm(range(num_rounds)):
+    for epoch in tqdm(range(num_communication_rounds)):
         print("Conducting the client selection...")
         selected_clients_set = client_selection(num_clients, client_selection_ratio, client_selection_strategy, epoch)
 
@@ -282,6 +284,8 @@ def STELLAR(
                             )
                             model_client = copy.deepcopy(model)
                             model_client = get_peft_model(model_client, config)
+                        else:
+                            model_client = model
             else:   
                 model_client = model
 
@@ -307,7 +311,7 @@ def STELLAR(
 
             print("\nTerminating the local training of Client_{}".format(client_id))
             model_client, local_dataset_len_dict, previously_selected_clients_set, last_client_id = client.terminate_local_training(
-                epoch, local_dataset_len_dict, previously_selected_clients_set, last_client_id
+                epoch, local_dataset_len_dict, previously_selected_clients_set
             )
             del client
 
@@ -320,9 +324,9 @@ def STELLAR(
         
         if not full_finetuning:
             if stacking:
-                config.save_pretrained(
+                config_ori.save_pretrained(
                     os.path.join(output_dir_path, str(epoch)), load_in_8bit = False, 
-                    torch_dtype = torch.float32, device_map = device_map
+                    torch_dtype = torch.float16, device_map = device_map
                 )
                 model = PeftModel.from_pretrained(
                     model, os.path.join(output_dir_path, str(epoch))
@@ -346,30 +350,30 @@ def STELLAR(
 
             print("save model...")
 
-            acc = global_evaluation(model, tokenizer, prompter, dev_data_path, output_dir_path)
-            print('Acc of Epoch', str(epoch), "is:", acc)
-            acc_list.append(acc)
+        acc = global_evaluation(model, tokenizer, prompter, dev_data_path, output_dir_path)
+        print('Acc of Epoch', str(epoch), "is:", acc)
+        acc_list.append(acc)
 
-            if stacking:
-                model = model.merge_and_unload()
-                model.save_pretrained(os.path.join(output_dir_path, str(epoch)+'/final'),
-                                      load_in_8bit = False,
-                                      torch_dtype = torch.float32,
-                                      device_map = device_map)
+        if stacking:
+            model = model.merge_and_unload()
+            model.save_pretrained(os.path.join(output_dir_path, str(epoch)+'/final'),
+                                    load_in_8bit = False,
+                                    torch_dtype = torch.float32,
+                                    device_map = device_map)
                 
-            if epoch < (num_rounds-1):
-                rm_dir = os.path.join(output_dir_path, str(epoch))
-                os.system("rm -rf {xxxxx}".format(xxxxx = rm_dir))
+        if epoch < (num_communication_rounds-1):
+            rm_dir = os.path.join(output_dir_path, str(epoch))
+            os.system("rm -rf {xxxxx}".format(xxxxx = rm_dir))
 
-            print(acc_list)
-            filename = output_dir_path + "log.txt"
-            file = open(filename, 'a')
-            for i in range(len(acc_list)):
-                s = str(acc_list[i].replace('[','').replace(']',''))
-                s = s.replace("'",'').replace(',','') +'\n'
-                file.write(s)
-            file.close()
-            print("Log Saved")
+    print(acc_list)
+    filename = output_dir_path + "log.txt"
+    file = open(filename, 'a')
+    for i in range(len(acc_list)):
+        s = str(acc_list[i].replace('[','').replace(']',''))
+        s = s.replace("'",'').replace(',','') +'\n'
+        file.write(s)
+    file.close()
+    print("Log Saved")
                 
 
 if __name__ == "__main__":

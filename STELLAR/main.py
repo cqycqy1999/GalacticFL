@@ -1,17 +1,48 @@
 import os
 import copy
 
+import json
 import fire
 from typing import List
 from tqdm import tqdm
 
 import torch
 from utils.prompter import Prompter
+from torch.profiler import profile, ProfilerActivity
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from peft import LoraConfig, AdaLoraConfig, PeftModel ,get_peft_model
 from FL_utils import (GeneralClient, FedAvg, client_selection,
                       global_evaluation)
 
+
+# 添加内存监控函数
+def log_gpu_memory_usage(tag, client_id = None, epoch = None, output_dir_path = None):
+    if not torch.cuda.is_available():
+        return
+    
+    allocated = torch.cuda.memory_allocated() / (1024 * 1024)
+    reserved = torch.cuda.memory_reserved() / (1024 * 1024)
+    max_allocated = torch.cuda.max_memory_allocated() / (1024 * 1024) 
+
+    log_dict = {
+        "timestamp": time.time(),
+        "tag": tag,
+        "client_id": client_id,
+        "epoch": epoch,
+        "allocated_MB": allocated,
+        "reserved_MB": reserved,
+        "max_allocated_MB": max_allocated,
+    }
+
+    # 创建日志目录并追加数据
+    if output_dir_path:
+        os.makedirs(os.path.join(output_dir_path, "memory_logs"), exist_ok=True)
+        log_path = os.path.join(output_dir_path, "memory_logs", "gpu_memory_log.jsonl")
+        with open(log_path, "a") as f:
+            f.write(json.dumps(log_dict) + "\n")
+
+    return log_dict
+   
 
 def STELLAR(
         # model/data argparse
@@ -306,8 +337,23 @@ def STELLAR(
             print("Initiating the local training of Client_{}".format(client_id))
             client.initiate_local_training()
 
-            print("Local training starts ... ")
-            client.train()
+            # TODO 训练前记录mem
+            log_gpu_memory_usage(f"client_before_training", client_id, epoch, output_dir_path)
+            with profile(
+                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                 profile_memory=True, record_shapes=True
+            ) as prof:
+                print("Local training starts ... ")
+                client.train()
+            
+            # TODO 训练后记录mem
+            log_gpu_memory_usage(f"client_after_training", client_id, epoch, output_dir_path)
+
+            # print("Local training starts ... ")
+            # client.train()
+            # TODO 保存本轮训练的性能分析结果
+            os.makedirs(os.path.join(output_dir_path, "memory_logs", "profiles"), exist_ok=True)
+            prof.export_chrome_trace(os.path.join(output_dir_path, "memory_logs", "profiles", f"client_{client_id}_epoch_{epoch}_trace.json"))
 
             print("\nTerminating the local training of Client_{}".format(client_id))
             model_client, local_dataset_len_dict, previously_selected_clients_set, last_client_id = client.terminate_local_training(
@@ -317,11 +363,27 @@ def STELLAR(
 
         print("\nCollecting the weights of clients and Conducting the global model aggregation...")
 
-        model = FedAvg(model, selected_clients_set, 
-                       output_dir_path, local_dataset_len_dict,
-                       epoch, stacking, lora_r, heter_adapter, local_ranks,
-                       zero_padding, full_finetuning)
-        
+        # TODO 聚合前记录全局模型的mem
+        log_gpu_memory_usage(f"server_before_aggregation", None, epoch, output_dir_path)
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            profile_memory=True, record_shapes=True
+        ) as prof:
+            model = FedAvg(model, selected_clients_set, 
+                           output_dir_path, local_dataset_len_dict,
+                           epoch, stacking, lora_r, heter_adapter, local_ranks,
+                           zero_padding, full_finetuning)
+            
+        # model = FedAvg(model, selected_clients_set, 
+        #                output_dir_path, local_dataset_len_dict,
+        #                epoch, stacking, lora_r, heter_adapter, local_ranks,
+        #                zero_padding, full_finetuning)
+        # TODO 聚合后记录全局模型的mem
+        log_gpu_memory_usage(f"server_after_aggregation", None, epoch, output_dir_path)
+
+        # TODO 保存聚合过程性能分析
+        prof.export_chrome_trace(os.path.join(output_dir_path, "memory_logs", "profiles", f"server_epoch_{epoch}_trace.json"))
+
         if not full_finetuning:
             if stacking:
                 config_ori.save_pretrained(

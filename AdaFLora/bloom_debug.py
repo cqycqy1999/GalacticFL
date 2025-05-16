@@ -6,5 +6,5 @@ inputs = tokenizer("Hello, my next paper TCAD must can accept!", return_tensors=
 outputs = model(**inputs)
 # original_output = model.predict(inputs)
 # print(outputs)
-with open('output1.txt', 'w') as f:
-    f.write(str(outputs))
+# with open('output1.txt', 'w') as f:
+#     f.write(str(outputs))

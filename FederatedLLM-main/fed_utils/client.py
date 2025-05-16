@@ -18,7 +18,7 @@ class GeneralClient:
         self.output_dir = output_dir
         self.local_output_dir = os.path.join(self.output_dir, "trainer_saved", "local_output_{}".format(self.client_id))
 
-    def preprare_local_dataset(self, generate_and_tokenize_prompt, local_val_set_size):
+    def prepare_local_dataset(self, generate_and_tokenize_prompt, local_val_set_size):
         if local_val_set_size > 0:
             local_train_val = self.local_data["train"].train_test_split(
                 test_size=local_val_set_size, shuffle=True, seed=42

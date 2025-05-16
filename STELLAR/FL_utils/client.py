@@ -8,6 +8,8 @@ import torch
 import transformers
 from peft import get_peft_model_state_dict, set_peft_model_state_dict
 
+from utils.profiler_utils import ProfilerTrainer
+
 
 class GeneralClient:
     def __init__(self, client_id, model, data_path, output_dir_path):
@@ -41,7 +43,9 @@ class GeneralClient:
                             local_num_epochs,
                             local_learning_rate,
                             group_by_length,
-                            ddp):
+                            ddp,
+                            profiler=None,
+                            ):
         self.train_args = transformers.TrainingArguments(
             per_device_train_batch_size=local_micro_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
@@ -62,7 +66,9 @@ class GeneralClient:
             group_by_length=group_by_length,
             dataloader_drop_last=False
         )
-        self.local_trainer = transformers.Trainer(
+        self.local_trainer = ProfilerTrainer(
+            # TODO: add profiler
+            profiler=profiler,
             model=self.model,
             args=self.train_args,
             train_dataset=self.local_train_dataset,

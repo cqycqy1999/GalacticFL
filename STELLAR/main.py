@@ -1,19 +1,113 @@
 import os
 import copy
+import time
+import datetime
 
 import json
 import fire
 from typing import List
 from tqdm import tqdm
+from pathlib import Path
 
 import torch
 from utils.prompter import Prompter
 from torch.profiler import profile, ProfilerActivity
+from torch.autograd.profiler import record_function
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from peft import LoraConfig, AdaLoraConfig, PeftModel ,get_peft_model
 from FL_utils import (GeneralClient, FedAvg, client_selection,
                       global_evaluation)
 
+# 添加snapshot管理函数
+def start_memory_snapshot():
+    """开始内存快照"""
+    if torch.cuda.is_available():
+        torch.cuda.memory._record_memory_history(max_entries=100000)
+        return True
+    return False
+
+def setup_profiler(client_id=None, epoch=None, output_dir_path=None):
+    """设置PyTorch Profiler并返回profiler对象和trace_handler"""
+    # 创建profile目录
+    profile_dir = os.path.join(output_dir_path, "memory_logs", "profiles")
+    os.makedirs(profile_dir, exist_ok=True)
+    
+    # 确定文件名前缀
+    if client_id is not None:
+        prefix = f"client_{client_id}_epoch_{epoch}"
+    else:
+        prefix = f"server_epoch_{epoch}"
+    
+    filepath = os.path.join(profile_dir, prefix)
+
+    # 创建trace handler函数
+    def trace_handler(prof):
+        # 导出Chrome trace格式文件
+        prof.export_chrome_trace(f"{filepath}_trace.json")
+        
+        # 导出内存时间线HTML文件
+        try:
+            # 获取当前CUDA设备，不依赖model
+            if torch.cuda.is_available():
+                device_id = torch.cuda.current_device()
+                device_str = f"cuda_{device_id}"
+                prof.export_memory_timeline(f"{filepath}_memory_{device_str}.html", device=f"cuda:{device_id}")
+                print(f"Memory timeline exported to {filepath}_memory_{device_str}.html")
+            else:
+                # 如果没有CUDA，导出CPU时间线
+                prof.export_memory_timeline(f"{filepath}_memory_cpu.html", device="cpu")
+                print(f"Memory timeline exported to {filepath}_memory_cpu.html")
+        except Exception as e:
+            print(f"Memory timeline export error: {e}")
+            # 添加更详细的错误信息便于调试
+            import traceback
+            traceback.print_exc()
+        
+        # 打印汇总表
+        print(prof.key_averages().table(sort_by="cuda_memory_usage", row_limit=20))
+    
+    # 创建profiler对象
+    profiler = torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA
+        ],
+        schedule=torch.profiler.schedule(
+            wait=1,     # 跳过第一步
+            warmup=1,   # 预热一步
+            active=10,  # 记录10步
+            repeat=1    # 不重复
+        ),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True,
+        on_trace_ready=trace_handler
+    )
+    
+    return profiler
+    
+def save_memory_snapshot(name, output_dir_path, client_id=None, epoch=None):
+    """保存内存快照到文件"""
+    if torch.cuda.is_available():
+        snapshot_dir = Path(output_dir_path) / "memory_logs" / "snapshots"
+        snapshot_dir.mkdir(exist_ok=True, parents=True)
+        
+        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        if client_id is not None and epoch is not None:
+            filename = f"{name}_client{client_id}_epoch{epoch}_{timestamp}.pickle"
+        elif epoch is not None:
+            filename = f"{name}_server_epoch{epoch}_{timestamp}.pickle"
+        else:
+            filename = f"{name}_{timestamp}.pickle"
+            
+        filepath = snapshot_dir / filename
+        torch.cuda.memory._dump_snapshot(str(filepath))
+        print(f"Memory snapshot saved to {filepath}")
+        
+        # 停止记录(如果需要)
+        # torch.cuda.memory._record_memory_history(enabled=None)
+        return str(filepath)
+    return None
 
 # 添加内存监控函数
 def log_gpu_memory_usage(tag, client_id = None, epoch = None, output_dir_path = None):
@@ -25,13 +119,13 @@ def log_gpu_memory_usage(tag, client_id = None, epoch = None, output_dir_path = 
     max_allocated = torch.cuda.max_memory_allocated() / (1024 * 1024) 
 
     log_dict = {
-        "timestamp": time.time(),
-        "tag": tag,
-        "client_id": client_id,
-        "epoch": epoch,
-        "allocated_MB": allocated,
-        "reserved_MB": reserved,
-        "max_allocated_MB": max_allocated,
+        "timestamp": float(time.time()),
+        "tag": str(tag),
+        "client_id": int(client_id) if client_id is not None else None,
+        "epoch": int(epoch) if epoch is not None else None,
+        "allocated_MB": float(allocated),
+        "reserved_MB": float(reserved),
+        "max_allocated_MB": float(max_allocated),
     }
 
     # 创建日志目录并追加数据
@@ -58,7 +152,7 @@ def STELLAR(
         # FL client argparse
         local_batch_size: int = 128,
         local_micro_batch_size: int = 16, # TODO
-        local_epochs: int = 1,
+        local_num_epochs: int = 1,
         local_learning_rate: float = 3e-4,
         local_val_setsize: int = 0,
         local_save_steps: int = 3, # TODO
@@ -101,7 +195,7 @@ def STELLAR(
             f"niid: {niid}\n"
             f"local_batch_size: {local_batch_size}\n"
             f"local_micro_batch_size: {local_micro_batch_size}\n"
-            f"local_epochs: {local_epochs}\n"
+            f"local_num_epochs: {local_num_epochs}\n"
             f"local_learning_rate: {local_learning_rate}\n"
             f"local_val_setsize: {local_val_setsize}\n"
             f"local_save_steps: {local_save_steps}\n"
@@ -258,6 +352,8 @@ def STELLAR(
     
     acc_list = []
 
+    #  客户端训练前，在客户端训练前后和服务器聚合前后添加快照记录
+
     for epoch in tqdm(range(num_communication_rounds)):
         print("Conducting the client selection...")
         selected_clients_set = client_selection(num_clients, client_selection_ratio, client_selection_strategy, epoch)
@@ -322,67 +418,82 @@ def STELLAR(
 
             client = GeneralClient(client_id, model_client, data_path, output_dir_path)
 
+            client_profiler = setup_profiler(client_id, epoch, output_dir_path)
+
+            log_gpu_memory_usage(f"client_before_training", client_id, epoch, output_dir_path)
+            start_memory_snapshot()  # 开始记录快照
+
             print("\nPreparing the local dataset and trainer for Client_{}".format(client_id))
             client.prepare_local_dataset(generate_and_tokenize_prompt, local_val_setsize)
             client.build_local_trainer(
                 tokenizer,
                 local_micro_batch_size,
                 gradient_accumulation_steps,
-                local_epochs,
+                local_num_epochs,
                 local_learning_rate,
                 group_by_length,
                 ddp,
+                profiler=client_profiler,
             )
 
             print("Initiating the local training of Client_{}".format(client_id))
             client.initiate_local_training()
 
             # TODO 训练前记录mem
-            log_gpu_memory_usage(f"client_before_training", client_id, epoch, output_dir_path)
-            with profile(
-                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                 profile_memory=True, record_shapes=True
-            ) as prof:
-                print("Local training starts ... ")
-                client.train()
+            # log_gpu_memory_usage(f"client_before_training", client_id, epoch, output_dir_path)
+            # with profile(
+            #      activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            #      profile_memory=True, record_shapes=True
+            # ) as prof:
+            #     print("Local training starts ... ")
+            #     client.train()
             
-            # TODO 训练后记录mem
-            log_gpu_memory_usage(f"client_after_training", client_id, epoch, output_dir_path)
+            # # TODO 训练后记录mem
+            # log_gpu_memory_usage(f"client_after_training", client_id, epoch, output_dir_path)
 
-            # print("Local training starts ... ")
-            # client.train()
+            # log_gpu_memory_usage(f"client_before_training", client_id, epoch, output_dir_path)
+            # start_memory_snapshot()  # 开始记录快照
+
+            print("Local training starts ... ")
+            client.train()
+            # with client_profiler:
+            #     client.train()
             # TODO 保存本轮训练的性能分析结果
-            os.makedirs(os.path.join(output_dir_path, "memory_logs", "profiles"), exist_ok=True)
-            prof.export_chrome_trace(os.path.join(output_dir_path, "memory_logs", "profiles", f"client_{client_id}_epoch_{epoch}_trace.json"))
+            # os.makedirs(os.path.join(output_dir_path, "memory_logs", "profiles"), exist_ok=True)
+            # prof.export_chrome_trace(os.path.join(output_dir_path, "memory_logs", "profiles", f"client_{client_id}_epoch_{epoch}_trace.json"))
 
             print("\nTerminating the local training of Client_{}".format(client_id))
             model_client, local_dataset_len_dict, previously_selected_clients_set, last_client_id = client.terminate_local_training(
                 epoch, local_dataset_len_dict, previously_selected_clients_set
             )
             del client
+            # TODO 训练后保存内存快照，保存在这个地方不一定对？可能在del client之前
+            log_gpu_memory_usage(f"client_after_training", client_id, epoch, output_dir_path)
+            save_memory_snapshot("training", output_dir_path, client_id, epoch)  # 保存训练快照
+
 
         print("\nCollecting the weights of clients and Conducting the global model aggregation...")
 
-        # TODO 聚合前记录全局模型的mem
-        log_gpu_memory_usage(f"server_before_aggregation", None, epoch, output_dir_path)
-        with profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            profile_memory=True, record_shapes=True
-        ) as prof:
-            model = FedAvg(model, selected_clients_set, 
-                           output_dir_path, local_dataset_len_dict,
-                           epoch, stacking, lora_r, heter_adapter, local_ranks,
-                           zero_padding, full_finetuning)
+        # # TODO 聚合前记录全局模型的mem
+        # log_gpu_memory_usage(f"server_before_aggregation", None, epoch, output_dir_path)
+        # with profile(
+        #     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        #     profile_memory=True, record_shapes=True
+        # ) as prof:
+        #     model = FedAvg(model, selected_clients_set, 
+        #                    output_dir_path, local_dataset_len_dict,
+        #                    epoch, stacking, lora_r, heter_adapter, local_ranks,
+        #                    zero_padding, full_finetuning)
             
-        # model = FedAvg(model, selected_clients_set, 
-        #                output_dir_path, local_dataset_len_dict,
-        #                epoch, stacking, lora_r, heter_adapter, local_ranks,
-        #                zero_padding, full_finetuning)
+        model = FedAvg(model, selected_clients_set, 
+                       output_dir_path, local_dataset_len_dict,
+                       epoch, stacking, lora_r, heter_adapter, local_ranks,
+                       zero_padding, full_finetuning)
         # TODO 聚合后记录全局模型的mem
-        log_gpu_memory_usage(f"server_after_aggregation", None, epoch, output_dir_path)
+        # log_gpu_memory_usage(f"server_after_aggregation", None, epoch, output_dir_path)
 
-        # TODO 保存聚合过程性能分析
-        prof.export_chrome_trace(os.path.join(output_dir_path, "memory_logs", "profiles", f"server_epoch_{epoch}_trace.json"))
+        # # TODO 保存聚合过程性能分析
+        # prof.export_chrome_trace(os.path.join(output_dir_path, "memory_logs", "profiles", f"server_epoch_{epoch}_trace.json"))
 
         if not full_finetuning:
             if stacking:
